@@ -11,6 +11,7 @@ from torch import Tensor
 
 
 
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -32,11 +33,10 @@ def run_linear(
     """
     Through einsum, we can intuitively compute the computating process instead of using transpose and matrix multiplication.
     This is the most direct method, just give the two inputs and the output dimension, and you can get the result you need.
+    But we should take care that each element should be expressed as a single letter and space is not allowed.
     """
-    return einsum(in_features, weights, "... d_in, d_out d_in -> ... d_out")
+    return torch.einsum("...i,oi->...o", in_features, weights)
 
-
-    raise NotImplementedError
 
 
 def run_embedding(
@@ -57,8 +57,10 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    '''
+    The so-called weights here is just a matrix that contains all embeddings. So the only thing we need to do is to index the matrix with the given token ids. And one token id corresponds to a vector with dimension of d_model.
+    '''
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -83,14 +85,19 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # SwiGLU implementation: output = (SiLU(x @ W1) * (x @ W3)) @ W2
+    # where SiLU(x) = x * sigmoid(x)
+    
+    # First linear transformation: x @ W1
+    gate = torch.einsum("...i,oi->...o", in_features, w1_weight)
+    # Second linear transformation: x @ W3  
+    value = torch.einsum("...i,oi->...o", in_features, w3_weight)
+    # Apply SiLU activation to gate: SiLU(gate) = gate * sigmoid(gate)
+    gate_activated = gate * torch.sigmoid(gate)
+    # Element-wise multiplication: SiLU(gate) * value
+    mult = gate_activated * value
+    # Final linear transformation: gated_value @ W2
+    return torch.einsum("...i,oi->...o", mult, w2_weight)
 
 
 def run_scaled_dot_product_attention(
@@ -111,7 +118,28 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # Compute scaled dot-product attention
+    d_k = Q.shape[-1]
+    scale = 1 / d_k ** 0.5
+    
+    # Compute attention scores: Q @ K^T
+    scores = torch.einsum("...ik,...jk->...ij", Q, K)
+    
+    # Apply scaling
+    scaled_scores = scores * scale
+    
+    # Apply mask if provided
+    if mask is not None:
+        scaled_scores = scaled_scores.masked_fill(mask == 0, -1e9)
+        # 巨坑 mask 不是直接乘以一个数，而是需要用masked_fill使用很小的数字来填充
+    
+    # Apply softmax to get attention weights
+    attention_weights = torch.softmax(scaled_scores, dim=-1)
+    
+    # Apply attention weights to values: attention_weights @ V
+    output = torch.einsum("...ij,...jk->...ik", attention_weights, V)
+    
+    return output
 
 
 def run_multihead_self_attention(
@@ -145,7 +173,18 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attn_output = []
+    for i in range(num_heads):
+        q = torch.einsum("...i,oi->...o", in_features, q_proj_weight)
+        k = torch.einsum("...i,oi->...o", in_features, k_proj_weight)
+        v = torch.einsum("...i,oi->...o", in_features, v_proj_weight)
+        attn_output.append(run_scaled_dot_product_attention(q, k, v))
+
+    attn_output = torch.stack(attn_output, dim=0)
+    # TODO: check if the attn_output is correct
+    multi_head_attention_output = torch.einsum("...i,oi->...o", attn_output, o_proj_weight)
+
+    return multi_head_attention_output
 
 
 def run_multihead_self_attention_with_rope(
